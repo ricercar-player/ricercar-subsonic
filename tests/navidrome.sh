@@ -1,6 +1,6 @@
 #!/bin/sh
 # Start a throwaway Navidrome on 127.0.0.1:4533 with generated FLAC files
-# (three 44.1 kHz / 16-bit tracks, two 192 kHz / 24-bit ones) and an admin
+# (three 44.1 kHz / 16-bit tracks, two 192 kHz / 24-bit ones, folder covers) and an admin
 # user admin / sesame, then run the end-to-end test against it.
 #   tests/navidrome.sh [workdir]      (needs docker, ffmpeg, python3)
 set -eu
@@ -19,6 +19,11 @@ for i in 1 2; do
     -ar 192000 -sample_fmt s32 -bits_per_raw_sample 24 -metadata title="Hi $i" \
     -metadata artist=Trio -metadata album_artist=Trio -metadata album=HiRes \
     -metadata date=2024 -metadata track=$i "$W/music/Trio/HiRes/0$i.flac"
+done
+# Folder covers: Navidrome 0.64 leaves `coverArt` out for albums without art.
+for d in Ensemble/Sessions Trio/HiRes; do
+  ffmpeg -loglevel error -y -f lavfi -i color=c=0x8a5a3c:s=300x300 -frames:v 1 \
+    "$W/music/$d/cover.jpg"
 done
 docker rm -f ricercar-subsonic-test >/dev/null 2>&1 || true
 docker run -d --name ricercar-subsonic-test -p 127.0.0.1:4533:4533 \

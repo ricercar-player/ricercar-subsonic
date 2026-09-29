@@ -3,7 +3,7 @@
 # URLs and the SHA-256 from the release's .sha256 files.
 id = "subsonic"
 name = "Subsonic"
-description = "Browse, search and play the music of your own Subsonic-compatible server: Navidrome, Gonic, Airsonic-Advanced, LMS, Ampache. Albums, artists, playlists and starred items, merged into your library. Original files, bit for bit; FLAC at a rate your DAC takes when the server can transcode (Navidrome 0.64+)."
+description = "Browse, search and play the music of your own Subsonic-compatible server: Navidrome, Gonic, Airsonic-Advanced, LMS, Ampache. Albums, artists, playlists and starred items, merged into your library, and Home shelves of recent, most played and random albums. Original files, bit for bit; FLAC at a rate your DAC takes when the server can transcode (Navidrome 0.64+)."
 author = "ricercar-player"
 license = "MIT"
 repository = "https://github.com/ricercar-player/ricercar-subsonic"

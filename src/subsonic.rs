@@ -231,6 +231,42 @@ fn unwrap(v: Value) -> Result<Value> {
     })
 }
 
+/// A transport failure without its URL, which carries the credentials.
+fn transport(t: &ureq::Transport) -> String {
+    let mut m = t.kind().to_string();
+    if let Some(msg) = t.message() {
+        m = format!("{m}: {msg}");
+    }
+    if let Some(src) = std::error::Error::source(t) {
+        m = format!("{m}: {src}");
+    }
+    redact(&m)
+}
+
+/// `text` with the values of credential query parameters (`u`, `t`, `s`,
+/// `p`, `apiKey`) blanked, for anything that may reach a log or a message.
+pub fn redact(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find(['?', '&']) {
+        out.push_str(&rest[..=i]);
+        rest = &rest[i + 1..];
+        let key = ["u=", "t=", "s=", "p=", "apiKey="]
+            .into_iter()
+            .find(|k| rest.starts_with(k));
+        if let Some(k) = key {
+            out.push_str(k);
+            out.push('…');
+            let end = rest
+                .find(|c: char| c == '&' || c == '#' || c.is_whitespace())
+                .unwrap_or(rest.len());
+            rest = &rest[end..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 pub struct Client {
     agent: ureq::Agent,
 }
@@ -290,7 +326,9 @@ impl Client {
         };
         match resp {
             Ok(r) => {
-                let text = r.into_string().map_err(|e| Error::Network(e.to_string()))?;
+                let text = r
+                    .into_string()
+                    .map_err(|e| Error::Network(redact(&e.to_string())))?;
                 let v = serde_json::from_str(&text)
                     .map_err(|_| Error::Network("not a Subsonic server".into()))?;
                 unwrap(v)
@@ -304,11 +342,11 @@ impl Client {
                     _ if code == 404 => Err(Error::NotFound),
                     _ => {
                         let msg: String = text.chars().take(200).collect();
-                        Err(Error::Status(code, msg.trim().to_string()))
+                        Err(Error::Status(code, redact(msg.trim())))
                     }
                 }
             }
-            Err(e) => Err(Error::Network(e.to_string())),
+            Err(ureq::Error::Transport(t)) => Err(Error::Network(transport(&t))),
         }
     }
 
@@ -424,6 +462,16 @@ fn server_name(r: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credentials_redacted() {
+        assert_eq!(
+            redact("http://h/rest/ping?u=bob&t=abc&s=12&v=1.16.1&apiKey=k p=x"),
+            "http://h/rest/ping?u=…&t=…&s=…&v=1.16.1&apiKey=… p=x"
+        );
+        assert_eq!(redact("?p=enc:6162"), "?p=…");
+        assert_eq!(redact("connection refused"), "connection refused");
+    }
 
     #[test]
     fn server_addresses() {

@@ -143,12 +143,13 @@ impl Plugin {
             std::fs::rename(&tmp, &path)
         })();
         if let Err(e) = written {
-            eprintln!("cannot save the session in {}: {e}", path.display());
+            eprintln!("cannot save the session in auth.json: {e}");
         }
         if matches!(s.auth, Auth::Password { .. }) {
             eprintln!("the server refuses tokens: the password is kept (hex) in auth.json");
         }
-        eprintln!("signed in as {} on {}", s.auth.user(), s.server);
+        // Never the user name: the log is shared in bug reports.
+        eprintln!("signed in on {}", subsonic::redact(&s.server));
         *self.session.lock().unwrap() = Some(s);
         *self.expired.lock().unwrap() = false;
         *self.artists.lock().unwrap() = None;
@@ -161,7 +162,10 @@ impl Plugin {
             Error::Auth | Error::Method(_) => {
                 let was = std::mem::replace(&mut *self.expired.lock().unwrap(), true);
                 if !was {
-                    eprintln!("the server refused the credentials: {e}");
+                    eprintln!(
+                        "the server refused the credentials: {}",
+                        subsonic::redact(&e.to_string())
+                    );
                     self.out.notify("auth.changed", self.auth_status());
                 }
                 rpc_err(-32001, "the server refused the stored credentials")
@@ -299,7 +303,21 @@ impl Plugin {
                 |(r, title)| json!({"ref": r, "kind": "folder", "title": title, "browsable": true}),
             )
             .collect();
-        Ok(json!({ "sections": sections }))
+        // Shelves of the host's Home page (starred items and playlists
+        // have their own places there).
+        let home = [
+            ("recent", t("Recently added", "Ajouts récents")),
+            ("played", t("Recently played", "Écoutés récemment")),
+            ("frequent", t("Most played", "Les plus écoutés")),
+            ("random", t("Random", "Au hasard")),
+        ];
+        let home: Vec<Value> = home
+            .iter()
+            .map(
+                |(r, title)| json!({"ref": r, "kind": "folder", "title": title, "browsable": true}),
+            )
+            .collect();
+        Ok(json!({ "sections": sections, "home": home }))
     }
 
     /// One page of `getAlbumList2` (no total: the server does not say).
@@ -314,7 +332,8 @@ impl Plugin {
             ],
         )?;
         let list = items::many(s, &v["albumList2"], "album", items::album);
-        let has_more = list.len() as u64 == limit;
+        // A random list has no end: one page only.
+        let has_more = kind != "random" && list.len() as u64 == limit;
         Ok(json!({"items": list, "has_more": has_more}))
     }
 
@@ -339,6 +358,12 @@ impl Plugin {
         Ok(list)
     }
 
+    /// The playlists the server shows this user (theirs and shared ones).
+    fn playlists(&self, s: &Session) -> Result<Vec<Value>, RpcError> {
+        let v = self.get(s, "getPlaylists", &[])?;
+        Ok(items::many(s, &v["playlists"], "playlist", items::playlist))
+    }
+
     fn list(&self, p: &Value) -> Reply {
         let s = self.session()?;
         let r = p["ref"].as_str().unwrap_or("");
@@ -348,11 +373,10 @@ impl Plugin {
             "recent" => return self.album_list(&s, "newest", offset, limit),
             "albums" => return self.album_list(&s, "alphabeticalByName", offset, limit),
             "frequent" => return self.album_list(&s, "frequent", offset, limit),
+            "played" => return self.album_list(&s, "recent", offset, limit),
+            "random" => return self.album_list(&s, "random", offset, limit),
             "artists" => self.all_artists(&s)?,
-            "playlists" => {
-                let v = self.get(&s, "getPlaylists", &[])?;
-                items::many(&s, &v["playlists"], "playlist", items::playlist)
-            }
+            "playlists" => self.playlists(&s)?,
             "favorites" => {
                 let v = self.get(&s, "getStarred2", &[])?;
                 let st = &v["starred2"];
@@ -449,9 +473,9 @@ impl Plugin {
         }
         if want("playlist") {
             // search3 does not cover playlists: match their names here.
-            let v = self.get(&s, "getPlaylists", &[])?;
             let needle = query.to_lowercase();
-            let all: Vec<Value> = items::many(&s, &v["playlists"], "playlist", items::playlist)
+            let all: Vec<Value> = self
+                .playlists(&s)?
                 .into_iter()
                 .filter(|p| {
                     p["title"]
@@ -509,6 +533,7 @@ impl Plugin {
         match method {
             "library.albums" => self.album_list(&s, "alphabeticalByName", offset, limit),
             "library.artists" => Ok(page(self.all_artists(&s)?, offset, limit)),
+            "library.playlists" => Ok(page(self.playlists(&s)?, offset, limit)),
             _ => {
                 // OpenSubsonic: an empty search3 query returns everything.
                 let v = self.get(
@@ -684,7 +709,7 @@ impl Plugin {
             _ => return,
         }
         if let Err(e) = self.client.get(&s, "scrobble", &q) {
-            eprintln!("{method}: {e}");
+            eprintln!("{method}: {}", subsonic::redact(&e.to_string()));
         }
     }
 
@@ -702,7 +727,9 @@ impl Plugin {
             "search" => self.search(p),
             "item.get" => self.item_get(p),
             "favorites.set" => self.favorite(p),
-            "library.albums" | "library.artists" | "library.tracks" => self.library(method, p),
+            "library.albums" | "library.artists" | "library.tracks" | "library.playlists" => {
+                self.library(method, p)
+            }
             "track.resolve" => self.resolve(p),
             _ => Err(rpc_err(-32601, format!("method not found: {method}"))),
         }

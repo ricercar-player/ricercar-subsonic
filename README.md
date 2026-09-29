@@ -10,7 +10,10 @@ family.
 - **Browse:** recently added, albums, artists, playlists, starred items and
   most played.
 - **Library:** your server's albums, artists and tracks join ricercar's own
-  Albums, Artists and Tracks pages and its search, marked *Subsonic*.
+  Albums, Artists and Tracks pages and its search, marked *Subsonic*; its
+  playlists join the sidebar's Playlists.
+- **Home:** shelves of recently added, recently played, most played and
+  random albums on ricercar's Home page.
 - **Search:** artists, albums, tracks and playlists.
 - **Bit-perfect:** tracks play from the original file, byte for byte
   (`stream?format=raw`, seekable). Only when your DAC cannot take a file's
@@ -83,6 +86,11 @@ Signing in from another computer than the one running ricercar: paste
   and in again. To use two servers at once, declare the plugin twice with
   different `id`s.
 - Use `https://` for a server outside your home network.
+- Playlists are those the server shows you: yours and the ones others
+  share. Subsonic's `search3` does not search playlists; the plugin matches
+  their names itself.
+- ricercar's log never gets your user name or credentials: errors are
+  stripped of the `u`, `t`, `s`, `p` and `apiKey` parameters.
 - The Tracks list uses an empty `search3` query, which OpenSubsonic servers
   answer with every song; some older servers return nothing there.
 
@@ -95,6 +103,7 @@ with the `library` capability.
 | Ref | Meaning |
 |---|---|
 | `recent`, `albums`, `artists`, `playlists`, `favorites`, `frequent` | Top-level sections |
+| `recent`, `played`, `frequent`, `random` | Home shelves (albums) |
 | `t/<id>` | Track (song) |
 | `a/<id>` | Album |
 | `r/<id>` | Artist (its albums) |

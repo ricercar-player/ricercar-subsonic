@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """End-to-end test of the plugin against a live Navidrome (see navidrome.sh):
 JSON-RPC over stdio, the sign-in page over HTTP, the streams with ffprobe."""
-import json, subprocess, sys, threading, queue, urllib.request, time, os, stat
+import json, re, subprocess, sys, threading, queue, urllib.request, time, os, stat
 S=sys.argv[1]; BIN=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "target", "release", "ricercar-subsonic")
 DATA=S+"/pdata"; os.makedirs(DATA, exist_ok=True)
 OUT={"device":"hw:9,0","bit_perfect":True,"max_rate":96000,"max_bits":24,"rates":[44100,48000,88200,96000]}
@@ -47,17 +47,33 @@ good=post(url+"password",{"server":c["server"],"user":"admin","password":"sesame
 n=p.notes.get(timeout=5); check(n["method"]=="auth.changed" and n["params"]["state"]=="signed_in","auth.changed: "+json.dumps(n["params"]["account"],ensure_ascii=False))
 a=json.load(open(DATA+"/auth.json")); mode=stat.S_IMODE(os.stat(DATA+"/auth.json").st_mode)
 check(a["auth"]["method"]=="token" and "sesame" not in json.dumps(a) and mode==0o600,"auth.json: token, no password, mode %o"%mode)
+A="u=admin&p=sesame&v=1.16.1&c=t&f=json"
 root=p.call("browse.root"); check([x["ref"] for x in root["sections"]]==["recent","albums","artists","playlists","favorites","frequent"],"root sections")
+check([x["ref"] for x in root["home"]]==["recent","played","frequent","random"] and all(x["browsable"] and x["title"] for x in root["home"]),"home shelves "+str([x["title"] for x in root["home"]]))
+for h in root["home"]:
+    r=p.call("browse.list",{"ref":h["ref"],"offset":0,"limit":50}); ks={x["kind"] for x in r.get("items",[])}
+    check("items" in r and ks<={"album","playlist"} and (h["ref"]!="random" or not r["has_more"]),"home %s: %d albums"%(h["ref"],len(r.get("items",[]))))
+check(len(p.call("browse.list",{"ref":"recent","offset":0,"limit":50})["items"])==2 and len(p.call("browse.list",{"ref":"random","offset":0,"limit":50})["items"])==2,"recently added / random list both albums")
 al=p.call("browse.list",{"ref":"albums","offset":0,"limit":50}); names=[x["title"] for x in al["items"]]; check(names==["HiRes","Sessions"],"albums "+str(names))
 sess=[x for x in al["items"] if x["title"]=="Sessions"][0]; check(sess["artist"]=="Ensemble" and sess["year"]==2021 and sess["art"].startswith("http://127.0.0.1:4533/rest/getCoverArt"),"album fields")
 tr=p.call("browse.list",{"ref":sess["ref"],"offset":0,"limit":200}); check([t["track_no"] for t in tr["items"]]==[1,2,3] and tr["items"][0]["format"]=={"sample_rate":44100,"bits":16,"channels":1,"codec":"flac"},"album tracks + format")
+pl_ids="&".join("songId="+x["ref"][2:] for x in tr["items"][:2])
+urllib.request.urlopen("http://127.0.0.1:4533/rest/createPlaylist?%s&name=Evening%%20mix&%s"%(A,pl_ids)).read()
 pg=p.call("browse.list",{"ref":sess["ref"],"offset":1,"limit":1}); check(len(pg["items"])==1 and pg["has_more"] and pg["total"]==3,"paging")
 ar=p.call("browse.list",{"ref":"artists","offset":0,"limit":50}); check(sorted(x["title"] for x in ar["items"])==["Ensemble","Trio"],"artists")
 tri=[x for x in ar["items"] if x["title"]=="Trio"][0]; check([x["title"] for x in p.call("browse.list",{"ref":tri["ref"],"offset":0,"limit":10})["items"]]==["HiRes"],"artist albums")
-sr=p.call("search",{"query":"hi","offset":0,"limit":10}); g={x["kind"]:len(x["items"]) for x in sr["groups"]}; check(g.get("album")==1 and g.get("track")==2,"search "+str(g))
+sr=p.call("search",{"query":"hi","offset":0,"limit":10}); g={x["kind"]:len(x["items"]) for x in sr["groups"]}; check(g.get("album")==1 and g.get("track")==2 and set(g)=={"artist","album","playlist","track"},"search "+str(g))
+sr=p.call("search",{"query":"trio","offset":0,"limit":10}); g={x["kind"]:[i["title"] for i in x["items"]] for x in sr["groups"]}; check(g.get("artist")==["Trio"] and all(i["kind"]=="artist" and i["browsable"] for x in sr["groups"] if x["kind"]=="artist" for i in x["items"]),"search artist "+str(g.get("artist")))
+sr=p.call("search",{"query":"evening","offset":0,"limit":10}); pls=[x for x in sr["groups"] if x["kind"]=="playlist"][0]["items"]
+check([x["title"] for x in pls]==["Evening mix"] and pls[0]["kind"]=="playlist" and pls[0]["browsable"],"search playlist "+str([x["title"] for x in pls]))
 check(p.call("search",{"query":"track","kinds":["track"],"offset":0,"limit":10})["groups"][0]["items"].__len__()==3,"search tracks only")
-for m,exp in (("library.albums",2),("library.artists",2),("library.tracks",5)):
-    r=p.call(m,{"offset":0,"limit":200}); check(len(r["items"])==exp,"%s: %d"%(m,len(r["items"])))
+for m,exp in (("library.albums",2),("library.artists",2),("library.tracks",5),("library.playlists",1)):
+    r=p.call(m,{"offset":0,"limit":200}); check(len(r["items"])==exp and "has_more" in r,"%s: %d"%(m,len(r["items"])))
+la=p.call("library.albums",{"offset":0,"limit":200})["items"]; check(all(x["kind"]=="album" and x["browsable"] and x.get("artist") and x.get("year") and x.get("art") for x in la),"library.albums: artist, year, art")
+lr=p.call("library.artists",{"offset":0,"limit":200})["items"]; check(all(x["kind"]=="artist" and x["browsable"] and x.get("art") for x in lr),"library.artists: art")
+lp=p.call("library.playlists",{"offset":0,"limit":200}); pl=lp["items"][0]
+check(pl["kind"]=="playlist" and pl["browsable"] and pl["title"]=="Evening mix" and not lp["has_more"],"library.playlists item")
+pt=p.call("browse.list",{"ref":pl["ref"],"offset":0,"limit":200})["items"]; check([x["title"] for x in pt]==["Track 1","Track 2"] and all(x["kind"]=="track" for x in pt),"playlist tracks "+str([x["title"] for x in pt]))
 t1=tr["items"][0]; check(p.call("item.get",{"ref":t1["ref"]})["title"]=="Track 1","item.get track")
 check(p.call("item.get",{"ref":"t/doesnotexist"}).get("code")==-32002,"item.get missing -> not_found")
 check(p.call("favorites.set",{"ref":t1["ref"],"on":True}) is None,"star track")
@@ -79,7 +95,7 @@ r=p.call("track.resolve",{"ref":hi["ref"],"purpose":"play"}); check(r.get("forma
 before=p.call("item.get",{"ref":t1["ref"]})
 p.notify("playback.started",{"ref":t1["ref"]}); time.sleep(0.5)
 p.notify("playback.ended",{"ref":t1["ref"],"listened_ms":20000,"reason":"ended"}); time.sleep(1.5)
-A="u=admin&p=sesame&v=1.16.1&c=t&f=json"; sid=t1["ref"][2:]
+sid=t1["ref"][2:]
 pc=json.load(urllib.request.urlopen("http://127.0.0.1:4533/rest/getSong?%s&id=%s"%(A,sid)))["subsonic-response"]["song"].get("playCount",0)
 check(pc==1,"scrobble counted a play (playCount=%s)"%pc)
 p.notify("playback.started",{"ref":tr["items"][1]["ref"]}); time.sleep(0.3)
@@ -98,4 +114,6 @@ check(e.get("code")==-32001 and n["params"]["state"]=="expired","refused token -
 check(p.call("auth.sign_out") is None and not os.path.exists(DATA+"/auth.json") and p.call("auth.status")["state"]=="signed_out","sign out")
 check(p.call("nope").get("code")==-32601,"unknown method")
 p.call("shutdown")
+log=open(S+"/plugin.log").read()
+check("admin" not in log and "sesame" not in log and not re.search(r"[?&](u|t|s|p|apiKey)=[^&…\s]",log),"log has no user name nor credentials")
 print("FAILURES:",ok); sys.exit(1 if ok else 0)
