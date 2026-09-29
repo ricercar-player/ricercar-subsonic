@@ -1,0 +1,22 @@
+# Entry for the ricercar plugin hub (github.com/ricercar-player/ricercar-plugins),
+# to publish as plugins/subsonic.toml. On a release, update `version`, the
+# URLs and the SHA-256 from the release's .sha256 files.
+id = "subsonic"
+name = "Subsonic"
+description = "Browse, search and play the music of your own Subsonic-compatible server: Navidrome, Gonic, Airsonic-Advanced, LMS, Ampache. Albums, artists, playlists and starred items, merged into your library. Original files, bit for bit; FLAC at a rate your DAC takes when the server can transcode (Navidrome 0.64+)."
+author = "ricercar-player"
+license = "MIT"
+repository = "https://github.com/ricercar-player/ricercar-subsonic"
+version = "0.1.0"
+protocol = 1
+capabilities = ["auth", "browse", "search", "resolve", "favorites", "reporting", "library"]
+
+[[assets]]
+arch = "x86_64"
+url = "https://github.com/ricercar-player/ricercar-subsonic/releases/download/v0.1.0/subsonic-x86_64"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[[assets]]
+arch = "aarch64"
+url = "https://github.com/ricercar-player/ricercar-subsonic/releases/download/v0.1.0/subsonic-aarch64"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"

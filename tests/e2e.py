@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""End-to-end test of the plugin against a live Navidrome (see navidrome.sh):
+JSON-RPC over stdio, the sign-in page over HTTP, the streams with ffprobe."""
+import json, subprocess, sys, threading, queue, urllib.request, time, os, stat
+S=sys.argv[1]; BIN=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "target", "release", "ricercar-subsonic")
+DATA=S+"/pdata"; os.makedirs(DATA, exist_ok=True)
+OUT={"device":"hw:9,0","bit_perfect":True,"max_rate":96000,"max_bits":24,"rates":[44100,48000,88200,96000]}
+class P:
+    def __init__(s):
+        s.p=subprocess.Popen([BIN,"--server","127.0.0.1:4533"],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=open(S+"/plugin.log","a"),text=True)
+        s.q={}; s.notes=queue.Queue(); s.n=0
+        threading.Thread(target=s.read,daemon=True).start()
+    def read(s):
+        for l in s.p.stdout:
+            m=json.loads(l)
+            if "id" in m: s.q[m["id"]].put(m)
+            else: s.notes.put(m)
+    def call(s,method,params=None):
+        s.n+=1; i=s.n; s.q[i]=queue.Queue()
+        s.p.stdin.write(json.dumps({"jsonrpc":"2.0","id":i,"method":method,"params":params or {}})+"\n"); s.p.stdin.flush()
+        m=s.q[i].get(timeout=20); return m.get("result", m.get("error"))
+    def notify(s,method,params):
+        s.p.stdin.write(json.dumps({"jsonrpc":"2.0","method":method,"params":params})+"\n"); s.p.stdin.flush()
+def post(url,body):
+    r=urllib.request.Request(url,data=json.dumps(body).encode(),headers={"Content-Type":"application/json"})
+    return json.load(urllib.request.urlopen(r))
+ok=0
+def check(c,msg):
+    global ok
+    print(("PASS " if c else "FAIL ")+msg); ok+= 0 if c else 1
+for f in ("auth.json",):
+    try: os.remove(DATA+"/"+f)
+    except FileNotFoundError: pass
+p=P()
+init=p.call("initialize",{"protocol":1,"data_dir":DATA,"locale":"fr-FR","output":OUT})
+check(init["capabilities"]["library"] and init["plugin"]["id"]=="subsonic","initialize")
+check(p.call("auth.status")["state"]=="signed_out","signed out at first")
+check(p.call("browse.root").get("code")==-32001,"browse before sign-in -> auth_required")
+b=p.call("auth.begin"); url=b["url"]
+html=urllib.request.urlopen(url).read().decode(); check("Adresse du serveur" in html and "127.0.0.1:4533" in html,"login page (fr, hint)")
+try: urllib.request.urlopen(url.rsplit("/",2)[0]+"/wrong/"); check(False,"bad secret refused")
+except urllib.error.HTTPError as e: check(e.code==404,"bad secret refused")
+c=post(url+"check",{"server":"127.0.0.1:4533"}); check(c["ok"] and c["name"].startswith("Navidrome"),"probe: "+str(c.get("name")))
+check(not post(url+"check",{"server":"127.0.0.1:9"})["ok"],"probe unreachable fails")
+bad=post(url+"password",{"server":c["server"],"user":"admin","password":"nope"}); check(not bad["ok"],"wrong password: "+bad.get("error",""))
+good=post(url+"password",{"server":c["server"],"user":"admin","password":"sesame"}); check(good["ok"] and good["done"],"password sign-in")
+n=p.notes.get(timeout=5); check(n["method"]=="auth.changed" and n["params"]["state"]=="signed_in","auth.changed: "+json.dumps(n["params"]["account"],ensure_ascii=False))
+a=json.load(open(DATA+"/auth.json")); mode=stat.S_IMODE(os.stat(DATA+"/auth.json").st_mode)
+check(a["auth"]["method"]=="token" and "sesame" not in json.dumps(a) and mode==0o600,"auth.json: token, no password, mode %o"%mode)
+root=p.call("browse.root"); check([x["ref"] for x in root["sections"]]==["recent","albums","artists","playlists","favorites","frequent"],"root sections")
+al=p.call("browse.list",{"ref":"albums","offset":0,"limit":50}); names=[x["title"] for x in al["items"]]; check(names==["HiRes","Sessions"],"albums "+str(names))
+sess=[x for x in al["items"] if x["title"]=="Sessions"][0]; check(sess["artist"]=="Ensemble" and sess["year"]==2021 and sess["art"].startswith("http://127.0.0.1:4533/rest/getCoverArt"),"album fields")
+tr=p.call("browse.list",{"ref":sess["ref"],"offset":0,"limit":200}); check([t["track_no"] for t in tr["items"]]==[1,2,3] and tr["items"][0]["format"]=={"sample_rate":44100,"bits":16,"channels":1,"codec":"flac"},"album tracks + format")
+pg=p.call("browse.list",{"ref":sess["ref"],"offset":1,"limit":1}); check(len(pg["items"])==1 and pg["has_more"] and pg["total"]==3,"paging")
+ar=p.call("browse.list",{"ref":"artists","offset":0,"limit":50}); check(sorted(x["title"] for x in ar["items"])==["Ensemble","Trio"],"artists")
+tri=[x for x in ar["items"] if x["title"]=="Trio"][0]; check([x["title"] for x in p.call("browse.list",{"ref":tri["ref"],"offset":0,"limit":10})["items"]]==["HiRes"],"artist albums")
+sr=p.call("search",{"query":"hi","offset":0,"limit":10}); g={x["kind"]:len(x["items"]) for x in sr["groups"]}; check(g.get("album")==1 and g.get("track")==2,"search "+str(g))
+check(p.call("search",{"query":"track","kinds":["track"],"offset":0,"limit":10})["groups"][0]["items"].__len__()==3,"search tracks only")
+for m,exp in (("library.albums",2),("library.artists",2),("library.tracks",5)):
+    r=p.call(m,{"offset":0,"limit":200}); check(len(r["items"])==exp,"%s: %d"%(m,len(r["items"])))
+t1=tr["items"][0]; check(p.call("item.get",{"ref":t1["ref"]})["title"]=="Track 1","item.get track")
+check(p.call("item.get",{"ref":"t/doesnotexist"}).get("code")==-32002,"item.get missing -> not_found")
+check(p.call("favorites.set",{"ref":t1["ref"],"on":True}) is None,"star track")
+check(p.call("favorites.set",{"ref":sess["ref"],"on":True}) is None,"star album")
+fav=p.call("browse.list",{"ref":"favorites","offset":0,"limit":50}); check(sorted(x["kind"] for x in fav["items"])==["album","track"],"favorites list")
+p.call("favorites.set",{"ref":sess["ref"],"on":False}); check(len(p.call("browse.list",{"ref":"favorites","offset":0,"limit":50})["items"])==1,"unstar album")
+# direct resolve
+r=p.call("track.resolve",{"ref":t1["ref"],"purpose":"play"}); check("format=raw" in r["url"] and r["duration_ms"]==20000 and r.get("replaygain",{}).get("track_gain")==-6.5,"resolve direct "+json.dumps(r.get("replaygain")))
+h=urllib.request.urlopen(r["url"]); check(h.headers.get("Content-Length") is not None and h.headers.get("Content-Type")=="audio/flac","direct stream has Content-Length")
+# hi-res on a 96k DAC -> transcode
+hi=[x for x in p.call("library.tracks",{"offset":0,"limit":200})["items"] if x["title"]=="Hi 1"][0]
+r=p.call("track.resolve",{"ref":hi["ref"],"purpose":"play"}); check("getTranscodeStream" in r.get("url","") and r["format"]["sample_rate"]==96000 and r["format"]["bits"]==24,"resolve hi-res -> "+json.dumps(r.get("format",r)))
+open(S+"/hi.flac","wb").write(urllib.request.urlopen(r["url"]).read())
+pr=subprocess.run(["ffprobe","-v","error","-show_entries","stream=sample_rate,bits_per_raw_sample","-of","csv=p=0",S+"/hi.flac"],capture_output=True,text=True).stdout.strip()
+check(pr=="96000,24","transcoded file is "+pr)
+p.notify("output.changed",{"output":{"bit_perfect":True,"max_rate":44100,"max_bits":16,"rates":[44100]}}); time.sleep(0.2)
+r=p.call("track.resolve",{"ref":hi["ref"],"purpose":"play"}); check(r.get("format",{}).get("sample_rate")==44100 and r["format"]["bits"]==16,"CD DAC: 192k -> "+json.dumps(r.get("format",r)))
+# reporting
+before=p.call("item.get",{"ref":t1["ref"]})
+p.notify("playback.started",{"ref":t1["ref"]}); time.sleep(0.5)
+p.notify("playback.ended",{"ref":t1["ref"],"listened_ms":20000,"reason":"ended"}); time.sleep(1.5)
+A="u=admin&p=sesame&v=1.16.1&c=t&f=json"; sid=t1["ref"][2:]
+pc=json.load(urllib.request.urlopen("http://127.0.0.1:4533/rest/getSong?%s&id=%s"%(A,sid)))["subsonic-response"]["song"].get("playCount",0)
+check(pc==1,"scrobble counted a play (playCount=%s)"%pc)
+p.notify("playback.started",{"ref":tr["items"][1]["ref"]}); time.sleep(0.3)
+p.notify("playback.ended",{"ref":tr["items"][1]["ref"],"listened_ms":3000,"reason":"skipped"}); time.sleep(1)
+pc2=json.load(urllib.request.urlopen("http://127.0.0.1:4533/rest/getSong?%s&id=%s"%(A,tr["items"][1]["ref"][2:])))["subsonic-response"]["song"].get("playCount",0)
+check(pc2==0,"short skip not counted")
+p.call("shutdown")
+# restart: session restored
+p=P(); p.call("initialize",{"protocol":1,"data_dir":DATA,"locale":"en","output":OUT})
+st=p.call("auth.status"); check(st["state"]=="signed_in","session restored after restart")
+# password changed on server -> expired
+tok=json.load(open(DATA+"/auth.json")); tok["auth"]["token"]="0"*32; json.dump(tok,open(DATA+"/auth.json","w"))
+p.call("shutdown"); p=P(); p.call("initialize",{"protocol":1,"data_dir":DATA,"output":OUT})
+e=p.call("browse.list",{"ref":"albums","offset":0,"limit":5}); n=p.notes.get(timeout=5)
+check(e.get("code")==-32001 and n["params"]["state"]=="expired","refused token -> expired + auth.changed")
+check(p.call("auth.sign_out") is None and not os.path.exists(DATA+"/auth.json") and p.call("auth.status")["state"]=="signed_out","sign out")
+check(p.call("nope").get("code")==-32601,"unknown method")
+p.call("shutdown")
+print("FAILURES:",ok); sys.exit(1 if ok else 0)

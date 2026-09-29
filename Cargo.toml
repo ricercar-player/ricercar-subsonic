@@ -1,0 +1,18 @@
+[package]
+name = "ricercar-subsonic"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "OpenSubsonic source plugin for the ricercar music player (Navidrome, Gonic, Airsonic, LMS…)"
+license = "MIT"
+repository = "https://github.com/ricercar-player/ricercar-subsonic"
+
+[dependencies]
+md-5 = "0.10"
+serde_json = "1"
+ureq = { version = "2.12", features = ["json"] }
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
