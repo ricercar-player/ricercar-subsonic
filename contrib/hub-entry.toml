@@ -14,9 +14,9 @@ capabilities = ["auth", "browse", "search", "resolve", "favorites", "reporting",
 [[assets]]
 arch = "x86_64"
 url = "https://github.com/ricercar-player/ricercar-subsonic/releases/download/v0.3.0/subsonic-x86_64"
-sha256 = "f99b33048e4eea1bf8ec71f4bd236318f51d273c8fd7b24a4442863ac18d1ca2"
+sha256 = "8a290ac7781579f7e21f30e915bff4e734ba2bd4266c8a42738de9c176148f83"
 
 [[assets]]
 arch = "aarch64"
 url = "https://github.com/ricercar-player/ricercar-subsonic/releases/download/v0.3.0/subsonic-aarch64"
-sha256 = "e665b5141dc72f4b76f50e4abcfa2f8345a16715eadb769e00945520c7a74e51"
+sha256 = "30c5f8dbd66a65ef2afa142e4ddb95829c77d80672cb2ced8cba12734b2f156e"
