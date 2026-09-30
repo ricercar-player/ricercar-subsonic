@@ -1,8 +1,10 @@
 //! Subsonic entries → ricercar items, and whether the DAC takes a file.
 //!
 //! Refs are `<prefix>/<subsonic id>`: `t` track (song), `a` album, `r`
-//! artist, `p` playlist. Top-level sections use bare words (`albums`,
-//! `artists`…).
+//! artist, `p` playlist; for the lists offered as item actions, `rt` track
+//! radio (a song id), `rr` artist radio, `top` an artist's top tracks and
+//! `sim` similar artists (artist ids). Top-level sections use bare words
+//! (`albums`, `artists`…).
 
 use serde_json::{Value, json};
 
@@ -13,7 +15,7 @@ use crate::subsonic::Session;
 /// (`al-12`, `4f1c…`, `1234`).
 pub fn split_ref(r: &str) -> Option<(&str, &str)> {
     let (k, id) = r.split_once('/')?;
-    let ok = matches!(k, "t" | "a" | "r" | "p")
+    let ok = matches!(k, "t" | "a" | "r" | "p" | "rt" | "rr" | "top" | "sim")
         && !id.is_empty()
         && id.len() <= 512
         && !id.chars().any(char::is_control);
@@ -78,6 +80,24 @@ fn genre(v: &Value) -> Option<String> {
         .or_else(|| text(v, "genre"))
 }
 
+/// `a/<albumId>` or `r/<artistId>`, when the entry names it.
+fn link(prefix: &str, id: Option<String>) -> Option<String> {
+    id.map(|id| format!("{prefix}/{id}"))
+        .filter(|r| split_ref(r).is_some())
+}
+
+/// The main artist's id: `artistId`, else the first of OpenSubsonic's
+/// `artists`.
+fn artist_id(v: &Value) -> Option<String> {
+    text(v, "artistId").or_else(|| text(&v["artists"][0], "id"))
+}
+
+/// Songs, albums and artists: starred by the signed-in user. Subsonic
+/// leaves `starred` out when they are not, so its absence means `false`.
+fn starred(v: &Value) -> bool {
+    v.get("starred").is_some_and(|s| !s.is_null())
+}
+
 fn finish(s: &Session, v: &Value, mut it: Value) -> Value {
     if let Some(c) = text(v, "coverArt") {
         it["art"] = s.cover(&c).into();
@@ -113,6 +133,9 @@ pub fn song(s: &Session, v: &Value) -> Option<Value> {
         "duration_ms": num(v, "duration").map(|d| d * 1000),
         "format": format(v),
         "playable": true,
+        "album_ref": link("a", text(v, "albumId")),
+        "artist_ref": link("r", artist_id(v)),
+        "favorite": starred(v),
     });
     Some(finish(s, v, it))
 }
@@ -134,6 +157,8 @@ pub fn album(s: &Session, v: &Value) -> Option<Value> {
         "genre": genre(v),
         "track_count": num(v, "songCount"),
         "browsable": true,
+        "artist_ref": link("r", artist_id(v)),
+        "favorite": starred(v),
     });
     Some(finish(s, v, it))
 }
@@ -152,6 +177,7 @@ pub fn artist(s: &Session, v: &Value) -> Option<Value> {
             "subtitle": num(v, "albumCount").map(|n| format!("{n} ◫")),
             "artist": name,
             "browsable": true,
+            "favorite": starred(v),
         }),
     );
     if it.get("art").is_none()
@@ -171,8 +197,109 @@ pub fn playlist(s: &Session, v: &Value) -> Option<Value> {
         "subtitle": v["songCount"].as_i64().map(|n| format!("{n} ♪")),
         "track_count": v["songCount"].as_i64(),
         "browsable": true,
+        "editable": editable(s, v),
     });
     Some(finish(s, v, it))
+}
+
+/// The signed-in user owns the playlist, and it is not one the server
+/// keeps up to date itself (OpenSubsonic `readonly`: smart playlists).
+/// User names compare without case, as servers sign them in.
+pub fn editable(s: &Session, v: &Value) -> bool {
+    let user = s.auth.user();
+    !user.is_empty()
+        && v["readonly"] != true
+        && v["owner"]
+            .as_str()
+            .is_some_and(|o| o.to_lowercase() == user.to_lowercase())
+}
+
+/// The songs of a `getPlaylist` answer, each with its `entry_id`: its
+/// position in the playlist and its song id (see [`entry`]).
+pub fn playlist_entries(s: &Session, v: &Value) -> Vec<Value> {
+    let list = match &v["entry"] {
+        Value::Array(a) => a.clone(),
+        o @ Value::Object(_) => vec![o.clone()],
+        _ => Vec::new(),
+    };
+    list.iter()
+        .enumerate()
+        .filter_map(|(i, e)| {
+            let mut it = song(s, e)?;
+            it["entry_id"] = entry_id(i, e["id"].as_str()?).into();
+            Some(it)
+        })
+        .collect()
+}
+
+/// `<index>:<song id>`. Subsonic removes playlist entries by position; the
+/// song id tells a stale position (the playlist changed since it was
+/// listed) from the right one.
+pub fn entry_id(index: usize, song: &str) -> String {
+    format!("{index}:{song}")
+}
+
+/// Position and song id of an `entry_id`.
+pub fn entry(e: &str) -> Option<(usize, &str)> {
+    let (i, id) = e.split_once(':')?;
+    if !i.bytes().all(|b| b.is_ascii_digit()) || id.is_empty() {
+        return None;
+    }
+    Some((i.parse().ok()?, id))
+}
+
+/// Related lists offered in the menu of tracks and artists, as refs that
+/// `browse.list` serves.
+fn actions(it: &Value, fr: bool) -> Option<Value> {
+    let t = |en: &str, f: &str| if fr { f.to_string() } else { en.to_string() };
+    let action = |id: &str, label: String, r: String, kind: &str| json!({"id": id, "label": label, "ref": r, "kind": kind});
+    let (kind, id) = split_ref(it["ref"].as_str()?)?;
+    let list = match kind {
+        "t" => vec![action(
+            "radio",
+            t("Track radio", "Radio de ce titre"),
+            format!("rt/{id}"),
+            "play",
+        )],
+        "r" => vec![
+            action(
+                "radio",
+                t("Artist radio", "Radio de l'artiste"),
+                format!("rr/{id}"),
+                "play",
+            ),
+            action(
+                "top",
+                t("Top tracks", "Titres populaires"),
+                format!("top/{id}"),
+                "browse",
+            ),
+            action(
+                "similar",
+                t("Similar artists", "Artistes similaires"),
+                format!("sim/{id}"),
+                "browse",
+            ),
+        ],
+        _ => return None,
+    };
+    Some(list.into())
+}
+
+/// Add `actions` to every track and artist of an answer: a lone item, or
+/// the `items` of a page, of search `groups` or of detail shelves
+/// (`related`).
+pub fn decorate(v: &mut Value, fr: bool) {
+    if let Some(a) = actions(v, fr) {
+        v["actions"] = a;
+    }
+    for key in ["items", "groups", "related"] {
+        if let Some(Value::Array(list)) = v.get_mut(key) {
+            for x in list {
+                decorate(x, fr);
+            }
+        }
+    }
 }
 
 /// Map `v[key]` (an array, or a lone object as some servers send for one
@@ -307,6 +434,8 @@ mod tests {
         assert_eq!(split_ref("t/"), None);
         assert_eq!(split_ref("t/a\nb"), None);
         assert_eq!(split_ref("albums"), None);
+        assert_eq!(split_ref("rr/ar-1"), Some(("rr", "ar-1")));
+        assert_eq!(split_ref("top/ar-1"), Some(("top", "ar-1")));
     }
 
     #[test]
@@ -380,6 +509,112 @@ mod tests {
             1
         );
         assert!(many(&s, &json!({}), "song", song).is_empty());
+    }
+
+    #[test]
+    fn links_and_stars() {
+        let s = session();
+        let t = song(
+            &s,
+            &json!({"id": "s1", "title": "T", "albumId": "al-1", "artistId": "ar-1",
+                    "starred": "2024-05-01T10:00:00Z"}),
+        )
+        .unwrap();
+        assert_eq!(t["album_ref"], "a/al-1");
+        assert_eq!(t["artist_ref"], "r/ar-1");
+        assert_eq!(t["favorite"], true);
+        // OpenSubsonic `artists` when `artistId` is missing; no `starred`.
+        let t = song(
+            &s,
+            &json!({"id": "s2", "title": "T", "artists": [{"id": "ar-2", "name": "B"}]}),
+        )
+        .unwrap();
+        assert!(t.get("album_ref").is_none());
+        assert_eq!(t["artist_ref"], "r/ar-2");
+        assert_eq!(t["favorite"], false);
+        let a = album(&s, &json!({"id": "al-1", "name": "A", "artistId": "ar-1"})).unwrap();
+        assert_eq!(a["artist_ref"], "r/ar-1");
+        assert_eq!(a["favorite"], false);
+        assert!(a.get("album_ref").is_none());
+        let r = artist(&s, &json!({"id": "ar-1", "name": "B", "starred": "2024"})).unwrap();
+        assert_eq!(r["favorite"], true);
+        assert!(r.get("artist_ref").is_none());
+    }
+
+    #[test]
+    fn playlist_owner() {
+        let s = session();
+        let mine = json!({"id": "p1", "name": "Mix", "owner": "A"});
+        assert_eq!(playlist(&s, &mine).unwrap()["editable"], true);
+        let theirs = json!({"id": "p2", "name": "Mix", "owner": "b"});
+        assert_eq!(playlist(&s, &theirs).unwrap()["editable"], false);
+        let smart = json!({"id": "p3", "name": "Mix", "owner": "a", "readonly": true});
+        assert_eq!(playlist(&s, &smart).unwrap()["editable"], false);
+        // An API key whose user the server did not name.
+        let anon = Session {
+            auth: Auth::ApiKey {
+                user: String::new(),
+                key: "k".into(),
+            },
+            ..session()
+        };
+        assert!(!editable(&anon, &json!({"owner": ""})));
+    }
+
+    #[test]
+    fn playlist_entry_ids() {
+        let pl = json!({"id": "p1", "entry": [
+            {"id": "s1", "title": "One"},
+            {"id": "v1", "title": "Clip", "isVideo": true},
+            {"id": "s1", "title": "One"},
+        ]});
+        let e = playlist_entries(&session(), &pl);
+        // The video is left out, and positions stay those of the server.
+        assert_eq!(
+            e.iter().map(|x| x["entry_id"].clone()).collect::<Vec<_>>(),
+            [json!("0:s1"), json!("2:s1")]
+        );
+        assert_eq!(e[0]["ref"], "t/s1");
+    }
+
+    #[test]
+    fn actions_added() {
+        let mut page = json!({"items": [
+            {"ref": "t/s1", "kind": "track"},
+            {"ref": "a/al-1", "kind": "album"},
+            {"ref": "p/p1", "kind": "playlist"}
+        ], "has_more": false});
+        decorate(&mut page, false);
+        assert_eq!(
+            page["items"][0]["actions"],
+            json!([{"id": "radio", "label": "Track radio", "ref": "rt/s1", "kind": "play"}])
+        );
+        assert!(page["items"][1].get("actions").is_none());
+        assert!(page["items"][2].get("actions").is_none());
+        let mut groups =
+            json!({"groups": [{"kind": "artist", "items": [{"ref": "r/ar-1", "kind": "artist"}]}]});
+        decorate(&mut groups, true);
+        let a = &groups["groups"][0]["items"][0]["actions"];
+        assert_eq!(
+            a.as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x["ref"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["rr/ar-1", "top/ar-1", "sim/ar-1"]
+        );
+        assert_eq!(a[0]["label"], "Radio de l'artiste");
+        assert_eq!(a[2]["kind"], "browse");
+        // Every action ref is one `browse.list` takes.
+        for x in a.as_array().unwrap() {
+            assert!(split_ref(x["ref"].as_str().unwrap()).is_some());
+        }
+        let mut one = json!({"ref": "t/s1", "kind": "track"});
+        decorate(&mut one, false);
+        assert_eq!(one["actions"][0]["ref"], "rt/s1");
+        let mut root = json!({"sections": [{"ref": "albums", "kind": "folder"}]});
+        decorate(&mut root, false);
+        assert!(root["sections"][0].get("actions").is_none());
     }
 
     #[test]

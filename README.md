@@ -26,6 +26,19 @@ family.
   playing", play counts and "most played").
 - **Loudness:** the ReplayGain tags the server reads (OpenSubsonic
   `replayGain`) are passed to ricercar.
+- **Lyrics:** synced lyrics when the server has them (OpenSubsonic
+  `songLyrics`), else plain ones (`getLyrics`).
+- **Details and related music:** artist biographies, similar artists and
+  top tracks, album notes and facts (label, genres, release type, dates),
+  "Go to album / artist" from any track, radios from a track or an artist
+  (`getSimilarSongs`, `getSimilarSongs2`), and continuous playback when
+  ricercar's queue runs out. Most servers build these from Last.fm: without
+  it, the lists may be empty.
+- **Playlists:** create, rename and delete your own playlists, add and
+  remove tracks; reorder them on Navidrome and Gonic. Playlists of other
+  users and smart playlists stay read-only.
+- **Settings**, where ricercar offers plugin settings: turn off play reporting, or keep
+  original files only (a file the DAC cannot take is then skipped).
 
 The plugin talks to the documented Subsonic / OpenSubsonic API only. It needs
 API version 1.13 or later (token authentication); tested with Navidrome 0.64.
@@ -98,7 +111,9 @@ Signing in from another computer than the one running ricercar: paste
 
 Plugin protocol 1, as described in ricercar's
 [docs/plugins.md](https://github.com/ricercar-player/ricercar/blob/main/docs/plugins.md),
-with the `library` capability.
+with the `library`, `lyrics`, `details`, `radio` and `playlist_edit`
+capabilities and plugin settings. Older ricercar versions ignore what they
+do not know.
 
 | Ref | Meaning |
 |---|---|
@@ -107,7 +122,9 @@ with the `library` capability.
 | `t/<id>` | Track (song) |
 | `a/<id>` | Album |
 | `r/<id>` | Artist (its albums) |
-| `p/<id>` | Playlist |
+| `p/<id>` | Playlist (its tracks carry `entry_id` = `<position>:<song id>`) |
+| `rt/<id>`, `rr/<id>` | Radio of a track, of an artist |
+| `top/<id>`, `sim/<id>` | Top tracks, similar artists of an artist |
 
 Error codes follow the protocol: refused credentials mark the session
 expired (`auth_required`) and send `auth.changed`; missing items answer

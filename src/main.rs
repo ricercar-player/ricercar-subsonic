@@ -7,14 +7,20 @@
 //! servers with the OpenSubsonic `transcoding` extension send FLAC at a rate
 //! it does take.
 //!
+//! Beyond the catalogue: lyrics, artist and album details, similar-song
+//! radios and editing the user's own playlists, each as far as the server
+//! offers it.
+//!
 //! Options:
 //!   --server URL   prefill the server address on the sign-in page
 
+mod info;
 mod items;
 mod login;
+mod playlists;
 mod subsonic;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -29,6 +35,10 @@ const PROTOCOL: u64 = 1;
 const PAGE: u64 = 200;
 /// How long the artist index is reused between pages.
 const ARTISTS_TTL: Duration = Duration::from_secs(300);
+/// Tracks of a radio list, and similar artists asked for.
+const RADIO: u64 = 50;
+/// Tracks of the "Top tracks" shelf of an artist's details.
+const TOP_SHELF: u64 = 10;
 
 /// `<n>` random bytes from the kernel, as hex.
 pub fn random_hex(n: usize) -> String {
@@ -45,6 +55,7 @@ fn now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
+#[derive(Debug)]
 struct RpcError {
     code: i64,
     message: String,
@@ -58,6 +69,61 @@ fn rpc_err(code: i64, message: impl Into<String>) -> RpcError {
 }
 
 type Reply = Result<Value, RpcError>;
+
+/// The plugin's settings, from `initialize` and `settings.changed`;
+/// missing keys take their defaults.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Settings {
+    /// Scrobble plays to the server (its "now playing" and play counts).
+    report_playback: bool,
+    /// Ask for FLAC at a rate the DAC takes when it cannot take a file;
+    /// otherwise such a file is unavailable on that output.
+    transcode: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            report_playback: true,
+            transcode: true,
+        }
+    }
+}
+
+impl Settings {
+    fn from_json(v: &Value) -> Settings {
+        let d = Settings::default();
+        Settings {
+            report_playback: v["report_playback"].as_bool().unwrap_or(d.report_playback),
+            transcode: v["transcode"]
+                .as_str()
+                .map_or(d.transcode, |t| t != "never"),
+        }
+    }
+
+    /// The declaration sent with the `initialize` result.
+    fn schema(fr: bool) -> Value {
+        let t = |en: &'static str, f: &'static str| if fr { f } else { en };
+        json!([
+            {"key": "report_playback", "type": "bool", "section": t("Playback", "Lecture"),
+             "label": t("Report what I play", "Signaler mes écoutes"),
+             "description": t(
+                 "Tell your server which tracks you play: its “now playing”, play counts and most played albums.",
+                 "Indiquer à votre serveur les pistes que vous écoutez : son « en cours de lecture », les compteurs d'écoute et les albums les plus écoutés."),
+             "default": true},
+            {"key": "transcode", "type": "choice", "section": t("Playback", "Lecture"),
+             "label": t("Files the DAC cannot take", "Fichiers que le DAC n'accepte pas"),
+             "description": t(
+                 "Tracks play from the original file. When the DAC cannot take a file's sample rate or bit depth, the plugin can ask the server for FLAC at a rate the DAC takes (OpenSubsonic transcoding, Navidrome 0.64 and later), or leave the track unavailable.",
+                 "Les pistes sont lues depuis le fichier d'origine. Quand le DAC n'accepte pas la fréquence ou la résolution d'un fichier, le plugin peut demander au serveur du FLAC à une fréquence que le DAC accepte (transcodage OpenSubsonic, Navidrome 0.64 et suivants), ou laisser la piste indisponible."),
+             "options": [
+                 {"value": "auto", "label": t("Ask the server for FLAC the DAC takes", "Demander au serveur du FLAC accepté par le DAC")},
+                 {"value": "never", "label": t("Original files only", "Fichiers d'origine uniquement")}
+             ],
+             "default": "auto"}
+        ])
+    }
+}
 
 struct Out(Mutex<std::io::Stdout>);
 
@@ -78,6 +144,9 @@ struct Plugin {
     server_hint: String,
     data_dir: Mutex<PathBuf>,
     french: Mutex<bool>,
+    /// The host's language (`fr`, `en`…), to pick among lyrics.
+    lang: Mutex<String>,
+    settings: Mutex<Settings>,
     output: Mutex<Output>,
     client: Arc<Client>,
     session: Mutex<Option<Session>>,
@@ -88,6 +157,8 @@ struct Plugin {
     artists: Mutex<Option<(Instant, Vec<Value>)>>,
     /// When each playing track started, for the scrobble's `time`.
     started: Mutex<HashMap<String, u64>>,
+    /// The server's OpenSubsonic extensions, once asked.
+    extensions: Mutex<Option<Vec<String>>>,
 }
 
 impl Plugin {
@@ -153,6 +224,7 @@ impl Plugin {
         *self.session.lock().unwrap() = Some(s);
         *self.expired.lock().unwrap() = false;
         *self.artists.lock().unwrap() = None;
+        *self.extensions.lock().unwrap() = None;
         self.out.notify("auth.changed", self.auth_status());
     }
 
@@ -187,6 +259,33 @@ impl Plugin {
         self.client.get(s, endpoint, q).map_err(|e| self.fail(e))
     }
 
+    /// Like `get`, for data a server may not have or not serve at all
+    /// (Last.fm lookups, lyrics, endpoints it lacks): `Null` then.
+    fn optional(&self, s: &Session, endpoint: &str, q: &[(&str, String)]) -> Reply {
+        match self.client.get(s, endpoint, q) {
+            Ok(v) => Ok(v),
+            Err(Error::NotFound | Error::Status(..)) => Ok(Value::Null),
+            Err(e) => Err(self.fail(e)),
+        }
+    }
+
+    /// Whether the server offers an OpenSubsonic extension. Asked once per
+    /// session; servers without OpenSubsonic offer none.
+    fn has_extension(&self, s: &Session, name: &str) -> bool {
+        if let Some(e) = &*self.extensions.lock().unwrap() {
+            return e.iter().any(|x| x == name);
+        }
+        let list: Vec<String> = match self.client.get(s, "getOpenSubsonicExtensions", &[]) {
+            Ok(v) => names_of(&v["openSubsonicExtensions"]),
+            // Not remembered: ask again next time.
+            Err(Error::Network(_)) => return false,
+            Err(_) => Vec::new(),
+        };
+        let has = list.iter().any(|x| x == name);
+        *self.extensions.lock().unwrap() = Some(list);
+        has
+    }
+
     // ---------------------------------------------------------------- setup
 
     fn initialize(&self, p: &Value) -> Reply {
@@ -195,7 +294,15 @@ impl Plugin {
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
         let _ = std::fs::create_dir_all(&data_dir);
-        *self.french.lock().unwrap() = p["locale"].as_str().is_some_and(|l| l.starts_with("fr"));
+        let locale = p["locale"].as_str().unwrap_or("");
+        let fr = locale.starts_with("fr");
+        *self.french.lock().unwrap() = fr;
+        *self.lang.lock().unwrap() = locale
+            .split(['-', '_', '.'])
+            .next()
+            .unwrap_or("")
+            .to_lowercase();
+        *self.settings.lock().unwrap() = Settings::from_json(&p["settings"]);
         *self.output.lock().unwrap() = Output::from_json(&p["output"]);
         *self.data_dir.lock().unwrap() = data_dir;
         *self.session.lock().unwrap() = std::fs::read_to_string(self.auth_path())
@@ -213,8 +320,10 @@ impl Plugin {
             "capabilities": {
                 "auth": true, "browse": true, "search": true, "resolve": true,
                 "favorites": true, "reporting": true, "remote_control": false,
-                "library": true
-            }
+                "library": true, "lyrics": true, "playlist_edit": true,
+                "details": true, "radio": true
+            },
+            "settings": Settings::schema(fr)
         }))
     }
 
@@ -279,6 +388,7 @@ impl Plugin {
         *self.session.lock().unwrap() = None;
         *self.expired.lock().unwrap() = false;
         *self.artists.lock().unwrap() = None;
+        *self.extensions.lock().unwrap() = None;
         let _ = std::fs::remove_file(self.auth_path());
         Ok(Value::Null)
     }
@@ -407,7 +517,18 @@ impl Plugin {
                     }
                     "p" => {
                         let v = self.get(&s, "getPlaylist", &q)?;
-                        items::many(&s, &v["playlist"], "entry", items::song)
+                        items::playlist_entries(&s, &v["playlist"])
+                    }
+                    "rt" => self.similar(&s, "t", id, RADIO)?,
+                    "rr" => self.similar(&s, "r", id, RADIO)?,
+                    "top" => self.top_songs(&s, id, RADIO)?,
+                    "sim" => {
+                        let v = self.optional(
+                            &s,
+                            "getArtistInfo2",
+                            &[("id", id.to_string()), ("count", RADIO.to_string())],
+                        )?;
+                        items::many(&s, &v["artistInfo2"], "similarArtist", items::artist)
                     }
                     _ => return Err(rpc_err(-32002, "no such list")),
                 }
@@ -500,7 +621,7 @@ impl Plugin {
             "a" => items::album(&s, &self.get(&s, "getAlbum", &q)?["album"]),
             "r" => items::artist(&s, &self.get(&s, "getArtist", &q)?["artist"]),
             "p" => items::playlist(&s, &self.get(&s, "getPlaylist", &q)?["playlist"]),
-            _ => None,
+            _ => return self.action_folder(&s, kind, id),
         };
         it.ok_or_else(|| rpc_err(-32002, "not a music item"))
     }
@@ -513,15 +634,286 @@ impl Plugin {
             "t" => "id",
             "a" => "albumId",
             "r" => "artistId",
-            _ => return Err(rpc_err(-32003, "playlists cannot be starred")),
+            "p" => return Err(rpc_err(-32003, "playlists cannot be starred")),
+            _ => return Err(rpc_err(-32002, "no such item")),
         };
         let endpoint = if p["on"].as_bool().unwrap_or(false) {
             "star"
         } else {
             "unstar"
         };
-        self.get(&s, endpoint, &[(key, id.to_string())])
-            .map(|_| Value::Null)
+        self.get(&s, endpoint, &[(key, id.to_string())])?;
+        if kind == "r" {
+            // The cached index carries the old `favorite`.
+            *self.artists.lock().unwrap() = None;
+        }
+        Ok(Value::Null)
+    }
+
+    // --------------------------------------------------- related, radio
+
+    /// Songs like a track (`t`: `getSimilarSongs`), an artist's (`r`:
+    /// `getSimilarSongs2`) or an album's artist's (`a`). A track the
+    /// server finds nothing like falls back to its artist. Servers build
+    /// these lists from Last.fm or their own data; they may be empty.
+    fn similar(
+        &self,
+        s: &Session,
+        kind: &str,
+        id: &str,
+        count: u64,
+    ) -> Result<Vec<Value>, RpcError> {
+        let songs2 = |artist: &str| -> Result<Vec<Value>, RpcError> {
+            let v = self.optional(
+                s,
+                "getSimilarSongs2",
+                &[("id", artist.to_string()), ("count", count.to_string())],
+            )?;
+            Ok(items::many(s, &v["similarSongs2"], "song", items::song))
+        };
+        let artist_of = |v: &Value| {
+            v["artistId"]
+                .as_str()
+                .or_else(|| v["artists"][0]["id"].as_str())
+                .map(str::to_string)
+        };
+        match kind {
+            "t" => {
+                let q = [("id", id.to_string()), ("count", count.to_string())];
+                let v = self.optional(s, "getSimilarSongs", &q)?;
+                let list = items::many(s, &v["similarSongs"], "song", items::song);
+                if !list.is_empty() {
+                    return Ok(list);
+                }
+                let song = self.get(s, "getSong", &[("id", id.to_string())])?;
+                match artist_of(&song["song"]) {
+                    Some(a) => songs2(&a),
+                    None => Ok(Vec::new()),
+                }
+            }
+            "r" => songs2(id),
+            "a" => {
+                let album = self.get(s, "getAlbum", &[("id", id.to_string())])?;
+                match artist_of(&album["album"]) {
+                    Some(a) => songs2(&a),
+                    None => Ok(Vec::new()),
+                }
+            }
+            _ => Err(rpc_err(-32002, "no radio for this item")),
+        }
+    }
+
+    /// An artist's most listened tracks: `getTopSongs`, which takes the
+    /// artist's name, read with `getArtist`.
+    fn top_songs(&self, s: &Session, id: &str, count: u64) -> Result<Vec<Value>, RpcError> {
+        let artist = self.get(s, "getArtist", &[("id", id.to_string())])?;
+        let Some(name) = artist["artist"]["name"].as_str().map(str::to_string) else {
+            return Ok(Vec::new());
+        };
+        let v = self.optional(
+            s,
+            "getTopSongs",
+            &[("artist", name), ("count", count.to_string())],
+        )?;
+        Ok(items::many(s, &v["topSongs"], "song", items::song))
+    }
+
+    /// `item.get` of an action's list (`rt/…`, `rr/…`, `top/…`, `sim/…`):
+    /// a folder named after it.
+    fn action_folder(&self, s: &Session, kind: &str, id: &str) -> Reply {
+        let fr = self.fr();
+        let t = |en: &'static str, f: &'static str| if fr { f } else { en };
+        let what = match kind {
+            "rt" => t("Track radio", "Radio de ce titre"),
+            "rr" => t("Artist radio", "Radio de l'artiste"),
+            "top" => t("Top tracks", "Titres populaires"),
+            "sim" => t("Similar artists", "Artistes similaires"),
+            _ => return Err(rpc_err(-32002, "not a music item")),
+        };
+        let q = [("id", id.to_string())];
+        let name = if kind == "rt" {
+            self.get(s, "getSong", &q)?["song"]["title"].clone()
+        } else {
+            self.get(s, "getArtist", &q)?["artist"]["name"].clone()
+        };
+        let title = match name.as_str().map(str::trim).filter(|n| !n.is_empty()) {
+            Some(n) => format!("{what} · {n}"),
+            None => what.to_string(),
+        };
+        Ok(json!({
+            "ref": format!("{kind}/{id}"),
+            "kind": "folder",
+            "title": title,
+            "browsable": true,
+        }))
+    }
+
+    /// `radio.next`: tracks like the seed (a track, album or artist), none
+    /// of `exclude` nor the seed itself, at most `limit`.
+    fn radio_next(&self, p: &Value) -> Reply {
+        let s = self.session()?;
+        let seed = p["seed"].as_str().unwrap_or("");
+        let (kind, id) = items::split_ref(seed).ok_or_else(|| rpc_err(-32002, "no such seed"))?;
+        let limit = p["limit"].as_u64().unwrap_or(20).clamp(1, 100) as usize;
+        let mut seen: HashSet<String> = p["exclude"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        seen.insert(seed.to_string());
+        // Enough to fill `limit` once the excluded ones are left out.
+        let count = (limit + seen.len()).min(PAGE as usize) as u64;
+        let kind = match kind {
+            "rt" => "t",
+            "rr" => "r",
+            k => k,
+        };
+        let items: Vec<Value> = self
+            .similar(&s, kind, id, count)?
+            .into_iter()
+            .filter(|it| {
+                it["ref"]
+                    .as_str()
+                    .is_some_and(|r| seen.insert(r.to_string()))
+            })
+            .take(limit)
+            .collect();
+        Ok(json!({ "items": items }))
+    }
+
+    // -------------------------------------------------------------- details
+
+    /// `item.details` of an artist or an album.
+    fn details(&self, p: &Value) -> Reply {
+        let s = self.session()?;
+        let (kind, id) = items::split_ref(p["ref"].as_str().unwrap_or(""))
+            .ok_or_else(|| rpc_err(-32002, "no such item"))?;
+        match kind {
+            "r" => self.artist_details(&s, id),
+            "a" => self.album_details(&s, id),
+            _ => Err(rpc_err(-32002, "no details for this item")),
+        }
+    }
+
+    /// Biography and similar artists (`getArtistInfo2`), top tracks
+    /// (`getTopSongs`), asked for side by side: servers may look them up
+    /// on Last.fm.
+    fn artist_details(&self, s: &Session, id: &str) -> Reply {
+        let fr = self.fr();
+        let t = |en: &'static str, f: &'static str| if fr { f } else { en };
+        let (info, top) = std::thread::scope(|sc| {
+            let info = sc.spawn(|| {
+                self.optional(
+                    s,
+                    "getArtistInfo2",
+                    &[("id", id.to_string()), ("count", "20".into())],
+                )
+            });
+            let top = self.top_songs(s, id, TOP_SHELF);
+            (info.join().unwrap_or(Ok(Value::Null)), top)
+        });
+        let (info, top) = (info?, top?);
+        let info = &info["artistInfo2"];
+        let mut out = json!({});
+        if let Some(b) = info["biography"].as_str().and_then(info::biography) {
+            out["biography"] = b;
+        }
+        let similar = items::many(s, info, "similarArtist", items::artist);
+        let related: Vec<Value> = [
+            (t("Top tracks", "Titres populaires"), top),
+            (t("Similar artists", "Artistes similaires"), similar),
+        ]
+        .into_iter()
+        .filter(|(_, l)| !l.is_empty())
+        .map(|(title, items)| json!({"title": title, "items": items}))
+        .collect();
+        if !related.is_empty() {
+            out["related"] = related.into();
+        }
+        Ok(out)
+    }
+
+    /// Notes (`getAlbumInfo2`), facts (label, genres, release type, dates:
+    /// OpenSubsonic fields of `getAlbum`) and the artist's other albums.
+    fn album_details(&self, s: &Session, id: &str) -> Reply {
+        let fr = self.fr();
+        let (info, album) = std::thread::scope(|sc| {
+            let info = sc.spawn(|| self.optional(s, "getAlbumInfo2", &[("id", id.to_string())]));
+            let album = self.get(s, "getAlbum", &[("id", id.to_string())]);
+            (info.join().unwrap_or(Ok(Value::Null)), album)
+        });
+        let (info, album) = (info?, album?);
+        let album = &album["album"];
+        let mut out = json!({});
+        if let Some(b) = info["albumInfo"]["notes"]
+            .as_str()
+            .and_then(info::biography)
+        {
+            out["biography"] = b;
+        }
+        let facts = info::album_facts(album, fr);
+        if !facts.is_empty() {
+            out["facts"] = facts.into();
+        }
+        let artist = album["artistId"]
+            .as_str()
+            .or_else(|| album["artists"][0]["id"].as_str());
+        if let Some(a) = artist {
+            let v = self.optional(s, "getArtist", &[("id", a.to_string())])?;
+            let mut others: Vec<&Value> = match &v["artist"]["album"] {
+                Value::Array(l) => l.iter().collect(),
+                o @ Value::Object(_) => vec![o],
+                _ => Vec::new(),
+            };
+            others.retain(|x| x["id"].as_str() != Some(id));
+            others.sort_by_key(|x| std::cmp::Reverse(x["year"].as_i64().unwrap_or(0)));
+            let others: Vec<Value> = others.iter().filter_map(|x| items::album(s, x)).collect();
+            if !others.is_empty() {
+                let title = if fr {
+                    "Du même artiste"
+                } else {
+                    "More by this artist"
+                };
+                out["related"] = json!([{"title": title, "items": others}]);
+            }
+        }
+        Ok(out)
+    }
+
+    // --------------------------------------------------------------- lyrics
+
+    /// OpenSubsonic `getLyricsBySongId` (`songLyrics` extension: synced
+    /// lyrics when the file has them), else `getLyrics` by artist and title
+    /// (plain text).
+    fn lyrics(&self, p: &Value) -> Reply {
+        let s = self.session()?;
+        let Some(("t", id)) = items::split_ref(p["ref"].as_str().unwrap_or("")) else {
+            return Err(rpc_err(-32002, "not a track"));
+        };
+        let none = || rpc_err(-32002, "no lyrics on the server");
+        if self.has_extension(&s, "songLyrics") {
+            let v = self.optional(&s, "getLyricsBySongId", &[("id", id.to_string())])?;
+            // An answer, even an empty one, covers what `getLyrics` knows.
+            if v.get("lyricsList").is_some() {
+                let lang = self.lang.lock().unwrap().clone();
+                return info::structured_lyrics(&v, &lang).ok_or_else(none);
+            }
+        }
+        let v = self.get(&s, "getSong", &[("id", id.to_string())])?;
+        let song = &v["song"];
+        let (Some(artist), Some(title)) = (song["artist"].as_str(), song["title"].as_str()) else {
+            return Err(none());
+        };
+        let v = self.optional(
+            &s,
+            "getLyrics",
+            &[("artist", artist.to_string()), ("title", title.to_string())],
+        )?;
+        info::plain_lyrics(&v).ok_or_else(none)
     }
 
     // -------------------------------------------------------------- library
@@ -568,17 +960,25 @@ impl Plugin {
         let rate = format["sample_rate"].as_u64().map(|r| r as u32);
         let bits = format["bits"].as_u64().map(|b| b as u8);
         let plan = items::plan(&self.output.lock().unwrap(), rate, bits);
+        let what = match bits {
+            Some(b) => format!("{} Hz / {b} bits", rate.unwrap_or(0)),
+            None => format!("{} Hz", rate.unwrap_or(0)),
+        };
         let (url, format) = match plan {
             Plan::Direct => (s.url("stream", &[("id", id), ("format", "raw")]), format),
+            // The user keeps originals only.
+            Plan::Flac { .. } if !self.settings.lock().unwrap().transcode => {
+                eprintln!("{r}: {what} does not fit this output, transcoding is off");
+                return Err(rpc_err(
+                    -32003,
+                    format!("the DAC cannot take {what}, and transcoding is off"),
+                ));
+            }
             Plan::Flac {
                 rate: to,
                 bits: depth,
             } => {
                 let t = self.transcode(&s, id, to, depth).map_err(|why| {
-                    let what = match bits {
-                        Some(b) => format!("{} Hz / {b} bits", rate.unwrap_or(0)),
-                        None => format!("{} Hz", rate.unwrap_or(0)),
-                    };
                     eprintln!("{r}: {what} does not fit this output, no transcode: {why}");
                     rpc_err(-32003, format!("the DAC cannot take {what}: {why}"))
                 })?;
@@ -674,6 +1074,9 @@ impl Plugin {
     /// "now playing"), and `submission=true` once it counts as played: to
     /// its end, or half of it, or four minutes.
     fn report(&self, method: &str, p: &Value) {
+        if !self.settings.lock().unwrap().report_playback {
+            return;
+        }
         let Ok(s) = self.session() else {
             return;
         };
@@ -716,6 +1119,15 @@ impl Plugin {
     // ------------------------------------------------------------- dispatch
 
     fn handle(self: &Arc<Self>, method: &str, p: &Value) -> Reply {
+        let mut reply = self.dispatch(method, p);
+        // Every track and artist sent gets its related lists as actions.
+        if let Ok(v) = &mut reply {
+            items::decorate(v, self.fr());
+        }
+        reply
+    }
+
+    fn dispatch(self: &Arc<Self>, method: &str, p: &Value) -> Reply {
         match method {
             "initialize" => self.initialize(p),
             "auth.status" => Ok(self.auth_status()),
@@ -731,9 +1143,24 @@ impl Plugin {
                 self.library(method, p)
             }
             "track.resolve" => self.resolve(p),
+            "lyrics.get" => self.lyrics(p),
+            "item.details" => self.details(p),
+            "radio.next" => self.radio_next(p),
+            m if m.starts_with("playlists.") => self.playlist_edit(m, p),
             _ => Err(rpc_err(-32601, format!("method not found: {method}"))),
         }
     }
+}
+
+/// The `name`s of a list of objects.
+fn names_of(v: &Value) -> Vec<String> {
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x["name"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn page(all: Vec<Value>, offset: u64, limit: u64) -> Value {
@@ -765,6 +1192,8 @@ fn main() {
         server_hint,
         data_dir: Mutex::new(std::env::temp_dir()),
         french: Mutex::new(false),
+        lang: Mutex::new(String::new()),
+        settings: Mutex::new(Settings::default()),
         output: Mutex::new(Output::default()),
         client: Arc::new(Client::new()),
         session: Mutex::new(None),
@@ -772,6 +1201,7 @@ fn main() {
         login: Mutex::new(None),
         artists: Mutex::new(None),
         started: Mutex::new(HashMap::new()),
+        extensions: Mutex::new(None),
     });
 
     for line in BufReader::new(std::io::stdin()).lines() {
@@ -788,6 +1218,10 @@ fn main() {
             match method.as_str() {
                 "output.changed" => {
                     *plugin.output.lock().unwrap() = Output::from_json(&params["output"]);
+                }
+                // Every declared key, with the value in effect.
+                "settings.changed" => {
+                    *plugin.settings.lock().unwrap() = Settings::from_json(&params["settings"]);
                 }
                 m if m.starts_with("playback.") => {
                     let plugin = plugin.clone();
@@ -819,6 +1253,28 @@ fn main() {
             run();
         } else {
             std::thread::spawn(run);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings() {
+        assert_eq!(Settings::from_json(&Value::Null), Settings::default());
+        let s = Settings::from_json(&json!({"report_playback": false, "transcode": "never"}));
+        assert!(!s.report_playback && !s.transcode);
+        // Keys of an older declaration are ignored; missing ones default.
+        let s = Settings::from_json(&json!({"quality": "x", "transcode": "auto"}));
+        assert_eq!(s, Settings::default());
+        for fr in [false, true] {
+            let schema = Settings::schema(fr);
+            for e in schema.as_array().unwrap() {
+                let d = Settings::from_json(&json!({ e["key"].as_str().unwrap(): e["default"] }));
+                assert_eq!(d, Settings::default(), "{}", e["key"]);
+            }
         }
     }
 }

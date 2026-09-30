@@ -271,6 +271,15 @@ pub struct Client {
     agent: ureq::Agent,
 }
 
+/// The body of a POST request.
+enum Body<'a> {
+    /// OpenSubsonic endpoints that take JSON.
+    Json(&'a Value),
+    /// Parameters as a form (OpenSubsonic `formPost`), for lists too long
+    /// for a query string.
+    Form(&'a [(&'a str, String)]),
+}
+
 impl Default for Client {
     fn default() -> Self {
         Self::new()
@@ -297,14 +306,14 @@ impl Client {
         self.request(server, endpoint, auth, query, None)
     }
 
-    /// GET, or POST with a JSON body (OpenSubsonic endpoints that take one).
+    /// GET, or POST with a JSON or form body.
     fn request(
         &self,
         server: &str,
         endpoint: &str,
         auth: Option<&Auth>,
         query: &[(&str, String)],
-        body: Option<&Value>,
+        body: Option<Body>,
     ) -> Result<Value> {
         let method = if body.is_some() { "POST" } else { "GET" };
         let mut req = self
@@ -321,7 +330,11 @@ impl Client {
             req = req.query(k, v);
         }
         let resp = match body {
-            Some(b) => req.send_json(b),
+            Some(Body::Json(b)) => req.send_json(b),
+            Some(Body::Form(f)) => {
+                let pairs: Vec<(&str, &str)> = f.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                req.send_form(&pairs)
+            }
             None => req.call(),
         };
         match resp {
@@ -445,7 +458,25 @@ impl Client {
         query: &[(&str, String)],
         body: &Value,
     ) -> Result<Value> {
-        self.request(&s.server, endpoint, Some(&s.auth), query, Some(body))
+        self.request(
+            &s.server,
+            endpoint,
+            Some(&s.auth),
+            query,
+            Some(Body::Json(body)),
+        )
+    }
+
+    /// POST with the parameters as a form; servers that take it declare the
+    /// OpenSubsonic `formPost` extension.
+    pub fn post_form(&self, s: &Session, endpoint: &str, form: &[(&str, String)]) -> Result<Value> {
+        self.request(
+            &s.server,
+            endpoint,
+            Some(&s.auth),
+            &[],
+            Some(Body::Form(form)),
+        )
     }
 }
 

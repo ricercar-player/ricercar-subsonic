@@ -1,14 +1,21 @@
 #!/bin/sh
 # Start a throwaway Navidrome on 127.0.0.1:4533 with generated FLAC files
-# (three 44.1 kHz / 16-bit tracks, two 192 kHz / 24-bit ones, folder covers) and an admin
+# (three 44.1 kHz / 16-bit tracks, two with lyrics, two 192 kHz / 24-bit ones, folder
+# covers) and an admin
 # user admin / sesame, then run the end-to-end test against it.
 #   tests/navidrome.sh [workdir]      (needs docker, ffmpeg, python3)
 set -eu
 W=${1:-$(mktemp -d)}
 mkdir -p "$W/music/Ensemble/Sessions" "$W/music/Trio/HiRes" "$W/data"
+# Lyrics: plain for track 1, synced (LRC) for track 2, none for track 3.
+lyrics_1=$(printf 'La la la\nLa la')
+lyrics_2=$(printf '[00:01.00]One\n[00:02.50]Two')
+lyrics_3=
 for i in 1 2 3; do
+  eval "lyrics=\$lyrics_$i"
   ffmpeg -loglevel error -y -f lavfi -i "sine=frequency=$((300 * i)):duration=20" \
     -ar 44100 -sample_fmt s16 -metadata title="Track $i" -metadata artist=Ensemble \
+    ${lyrics:+-metadata "LYRICS=$lyrics"} \
     -metadata album_artist=Ensemble -metadata album=Sessions -metadata date=2021 \
     -metadata track=$i -metadata genre=Jazz \
     -metadata REPLAYGAIN_TRACK_GAIN="-6.5 dB" -metadata REPLAYGAIN_TRACK_PEAK=0.9 \
