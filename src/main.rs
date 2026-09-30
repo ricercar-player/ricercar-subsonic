@@ -23,7 +23,7 @@ mod subsonic;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
@@ -294,14 +294,7 @@ impl Plugin {
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
         let _ = std::fs::create_dir_all(&data_dir);
-        let locale = p["locale"].as_str().unwrap_or("");
-        let fr = locale.starts_with("fr");
-        *self.french.lock().unwrap() = fr;
-        *self.lang.lock().unwrap() = locale
-            .split(['-', '_', '.'])
-            .next()
-            .unwrap_or("")
-            .to_lowercase();
+        let fr = self.set_locale(p["locale"].as_str().unwrap_or(""));
         *self.settings.lock().unwrap() = Settings::from_json(&p["settings"]);
         *self.output.lock().unwrap() = Output::from_json(&p["output"]);
         *self.data_dir.lock().unwrap() = data_dir;
@@ -325,6 +318,19 @@ impl Plugin {
             },
             "settings": Settings::schema(fr)
         }))
+    }
+
+    /// The host's interface language (`fr-FR`, `en`…): labels in French
+    /// for `fr`, else in English. Whether French.
+    fn set_locale(&self, locale: &str) -> bool {
+        let fr = locale.starts_with("fr");
+        *self.french.lock().unwrap() = fr;
+        *self.lang.lock().unwrap() = locale
+            .split(['-', '_', '.'])
+            .next()
+            .unwrap_or("")
+            .to_lowercase();
+        fr
     }
 
     // ----------------------------------------------------------------- auth
@@ -1204,6 +1210,19 @@ fn main() {
         extensions: Mutex::new(None),
     });
 
+    // Playback reports in the order they came, off the reading loop: an
+    // `ended` must not overtake the `started` it follows.
+    let reports = {
+        let (tx, rx) = mpsc::channel::<(String, Value)>();
+        let plugin = plugin.clone();
+        std::thread::spawn(move || {
+            for (method, params) in rx {
+                plugin.report(&method, &params);
+            }
+        });
+        tx
+    };
+
     for line in BufReader::new(std::io::stdin()).lines() {
         let Ok(line) = line else { break };
         let Ok(msg) = serde_json::from_str::<Value>(&line) else {
@@ -1219,13 +1238,20 @@ fn main() {
                 "output.changed" => {
                     *plugin.output.lock().unwrap() = Output::from_json(&params["output"]);
                 }
+                // The user switched language: the settings dialog follows.
+                "locale.changed" => {
+                    let fr = plugin.set_locale(params["locale"].as_str().unwrap_or(""));
+                    out.notify(
+                        "settings.declared",
+                        json!({ "settings": Settings::schema(fr) }),
+                    );
+                }
                 // Every declared key, with the value in effect.
                 "settings.changed" => {
                     *plugin.settings.lock().unwrap() = Settings::from_json(&params["settings"]);
                 }
                 m if m.starts_with("playback.") => {
-                    let plugin = plugin.clone();
-                    std::thread::spawn(move || plugin.report(&method, &params));
+                    let _ = reports.send((method, params));
                 }
                 _ => {}
             }

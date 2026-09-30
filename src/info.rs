@@ -233,7 +233,8 @@ fn date(v: &Value) -> Option<String> {
 
 /// `1 h 02 min`, `42 min`.
 fn duration(secs: i64) -> String {
-    let m = (secs + 30) / 60;
+    // A few seconds still read as a minute, not "0 min".
+    let m = ((secs + 30) / 60).max(1);
     if m >= 60 {
         format!("{} h {:02} min", m / 60, m % 60)
     } else {
@@ -437,5 +438,12 @@ mod tests {
                 json!({"label": "Parution", "value": "1977"})
             ]
         );
+    }
+
+    #[test]
+    fn durations() {
+        assert_eq!(duration(10), "1 min");
+        assert_eq!(duration(2520), "42 min");
+        assert_eq!(duration(3725), "1 h 02 min");
     }
 }
