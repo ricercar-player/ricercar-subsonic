@@ -132,6 +132,7 @@ pub fn album(s: &Session, v: &Value) -> Option<Value> {
         "album": title,
         "year": year,
         "genre": genre(v),
+        "track_count": num(v, "songCount"),
         "browsable": true,
     });
     Some(finish(s, v, it))
@@ -168,6 +169,7 @@ pub fn playlist(s: &Session, v: &Value) -> Option<Value> {
         "kind": "playlist",
         "title": text(v, "name").unwrap_or_else(|| "?".into()),
         "subtitle": v["songCount"].as_i64().map(|n| format!("{n} ♪")),
+        "track_count": v["songCount"].as_i64(),
         "browsable": true,
     });
     Some(finish(s, v, it))
@@ -354,10 +356,12 @@ mod tests {
         let s = session();
         let a = album(
             &s,
-            &json!({"id": "a1", "name": "Sessions", "artist": "Ensemble", "year": 2021}),
+            &json!({"id": "a1", "name": "Sessions", "artist": "Ensemble", "year": 2021,
+                    "songCount": 9}),
         )
         .unwrap();
         assert_eq!(a["subtitle"], "Ensemble · 2021");
+        assert_eq!(a["track_count"], 9);
         assert_eq!(a["browsable"], true);
         let r = artist(
             &s,
@@ -369,6 +373,7 @@ mod tests {
         assert_eq!(r["art"], "https://img/x.jpg");
         let p = playlist(&s, &json!({"id": "p1", "name": "Mix", "songCount": 12})).unwrap();
         assert_eq!(p["subtitle"], "12 ♪");
+        assert_eq!(p["track_count"], 12);
         // A lone object where an array was expected.
         assert_eq!(
             many(&s, &json!({"song": {"id": "1"}}), "song", song).len(),

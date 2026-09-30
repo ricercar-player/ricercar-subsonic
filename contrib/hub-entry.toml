@@ -7,16 +7,16 @@ description = "Browse, search and play the music of your own Subsonic-compatible
 author = "ricercar-player"
 license = "MIT"
 repository = "https://github.com/ricercar-player/ricercar-subsonic"
-version = "0.2.0"
+version = "0.2.1"
 protocol = 1
 capabilities = ["auth", "browse", "search", "resolve", "favorites", "reporting", "library"]
 
 [[assets]]
 arch = "x86_64"
-url = "https://github.com/ricercar-player/ricercar-subsonic/releases/download/v0.2.0/subsonic-x86_64"
+url = "https://github.com/ricercar-player/ricercar-subsonic/releases/download/v0.2.1/subsonic-x86_64"
 sha256 = "eabcb5b48488e81c4406d6c6260c20356207f0289ce9489f8b2a169d535f3b0e"
 
 [[assets]]
 arch = "aarch64"
-url = "https://github.com/ricercar-player/ricercar-subsonic/releases/download/v0.2.0/subsonic-aarch64"
+url = "https://github.com/ricercar-player/ricercar-subsonic/releases/download/v0.2.1/subsonic-aarch64"
 sha256 = "6a7a50dc7dec2473f2582a52c6bb1a1c4a55ec9841aa39b5c66a21404a736ea3"

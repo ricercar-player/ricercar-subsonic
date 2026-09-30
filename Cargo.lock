@@ -319,7 +319,7 @@ dependencies = [
 
 [[package]]
 name = "ricercar-subsonic"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "md-5",
  "serde_json",
